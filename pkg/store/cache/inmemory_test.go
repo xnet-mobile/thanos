@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -62,37 +61,6 @@ max_item_size: 1MB
 
 	// testutil.Equals(t, uint64(1024*1024), cache.maxItemSizeBytes)
 	// testutil.Equals(t, uint64(2*1024), cache.maxSizeBytes)
-}
-
-func TestInMemoryIndexCache_AvoidsDeadlock(t *testing.T) {
-	metrics := prometheus.NewRegistry()
-	cache, err := NewInMemoryIndexCacheWithConfig(log.NewNopLogger(), nil, metrics, InMemoryIndexCacheConfig{
-		MaxItemSize: sliceHeaderSize + 5,
-		MaxSize:     sliceHeaderSize + 5,
-	})
-	testutil.Ok(t, err)
-
-	l, err := simplelru.NewLRU(math.MaxInt64, func(key, val interface{}) {
-		// Hack LRU to simulate broken accounting: evictions do not reduce current size.
-		size := cache.curSize
-		cache.onEvict(key, val)
-		cache.curSize = size
-	})
-	testutil.Ok(t, err)
-	cache.lru = l
-
-	cache.StorePostings(ulid.MustNew(0, nil), labels.Label{Name: "test2", Value: "1"}, []byte{42, 33, 14, 67, 11}, tenancy.DefaultTenant)
-
-	testutil.Equals(t, uint64(sliceHeaderSize+5), cache.curSize)
-	testutil.Equals(t, float64(cache.curSize), promtest.ToFloat64(cache.currentSize.WithLabelValues(cacheTypePostings)))
-	testutil.Equals(t, float64(1), promtest.ToFloat64(cache.current.WithLabelValues(cacheTypePostings)))
-
-	// This triggers deadlock logic.
-	cache.StorePostings(ulid.MustNew(0, nil), labels.Label{Name: "test1", Value: "1"}, []byte{42}, tenancy.DefaultTenant)
-
-	testutil.Equals(t, uint64(sliceHeaderSize+1), cache.curSize)
-	testutil.Equals(t, float64(cache.curSize), promtest.ToFloat64(cache.currentSize.WithLabelValues(cacheTypePostings)))
-	testutil.Equals(t, float64(1), promtest.ToFloat64(cache.current.WithLabelValues(cacheTypePostings)))
 }
 
 func TestInMemoryIndexCache_UpdateItem(t *testing.T) {
@@ -170,8 +138,6 @@ func TestInMemoryIndexCache_UpdateItem(t *testing.T) {
 			buf, ok := tt.get(0)
 			testutil.Equals(t, true, ok)
 			testutil.Equals(t, []byte{0}, buf)
-			testutil.Equals(t, float64(sliceHeaderSize+1), promtest.ToFloat64(cache.currentSize.WithLabelValues(tt.typ)))
-			testutil.Equals(t, float64(1), promtest.ToFloat64(cache.current.WithLabelValues(tt.typ)))
 			testutil.Equals(t, []string(nil), errorLogs)
 
 			// Set the same value again.
@@ -180,8 +146,6 @@ func TestInMemoryIndexCache_UpdateItem(t *testing.T) {
 			buf, ok = tt.get(0)
 			testutil.Equals(t, true, ok)
 			testutil.Equals(t, []byte{0}, buf)
-			testutil.Equals(t, float64(sliceHeaderSize+1), promtest.ToFloat64(cache.currentSize.WithLabelValues(tt.typ)))
-			testutil.Equals(t, float64(1), promtest.ToFloat64(cache.current.WithLabelValues(tt.typ)))
 			testutil.Equals(t, []string(nil), errorLogs)
 
 			// Set a larger value.

@@ -6,22 +6,31 @@ package storecache
 import (
 	"context"
 	"reflect"
-	"sync"
 	"unsafe"
 
+	"github.com/VictoriaMetrics/fastcache"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	lru "github.com/hashicorp/golang-lru/simplelru"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
-	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/tenancy"
+)
+
+const (
+	chunkSize = 64 * 1024
+
+	// maxKeyLen is the maximum size of key.
+	//
+	// - 16 bytes are for (hash + valueLen)
+	// - 4 bytes are for len(key)+len(subkey)
+	// - 1 byte is implementation detail of fastcache
+	maxKeyLen = chunkSize - 16 - 4 - 1
 )
 
 var (
@@ -31,24 +40,15 @@ var (
 	}
 )
 
-const maxInt = int(^uint(0) >> 1)
-
 type InMemoryIndexCache struct {
-	mtx sync.Mutex
-
 	logger           log.Logger
-	lru              *lru.LRU
+	cache            *fastcache.Cache
 	maxSizeBytes     uint64
 	maxItemSizeBytes uint64
 
-	curSize uint64
-
-	evicted          *prometheus.CounterVec
-	added            *prometheus.CounterVec
-	current          *prometheus.GaugeVec
-	currentSize      *prometheus.GaugeVec
-	totalCurrentSize *prometheus.GaugeVec
-	overflow         *prometheus.CounterVec
+	added     *prometheus.CounterVec
+	overflow  *prometheus.CounterVec
+	keyTooBig *prometheus.CounterVec
 
 	commonMetrics *commonMetrics
 }
@@ -100,14 +100,6 @@ func NewInMemoryIndexCacheWithConfig(logger log.Logger, commonMetrics *commonMet
 		commonMetrics:    commonMetrics,
 	}
 
-	c.evicted = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-		Name: "thanos_store_index_cache_items_evicted_total",
-		Help: "Total number of items that were evicted from the index cache.",
-	}, []string{"item_type"})
-	c.evicted.WithLabelValues(cacheTypePostings)
-	c.evicted.WithLabelValues(cacheTypeSeries)
-	c.evicted.WithLabelValues(cacheTypeExpandedPostings)
-
 	c.added = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 		Name: "thanos_store_index_cache_items_added_total",
 		Help: "Total number of items that were added to the index cache.",
@@ -128,55 +120,19 @@ func NewInMemoryIndexCacheWithConfig(logger log.Logger, commonMetrics *commonMet
 	c.overflow.WithLabelValues(cacheTypeSeries)
 	c.overflow.WithLabelValues(cacheTypeExpandedPostings)
 
+	c.keyTooBig = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "thanos_store_index_cache_items_key_too_big_total",
+		Help: "Total number of items that could not be added to the cache due to key being too big.",
+	}, []string{"item_type"})
+	c.keyTooBig.WithLabelValues(cacheTypePostings)
+	c.keyTooBig.WithLabelValues(cacheTypeSeries)
+	c.keyTooBig.WithLabelValues(cacheTypeExpandedPostings)
+
 	c.commonMetrics.hitsTotal.WithLabelValues(cacheTypePostings, tenancy.DefaultTenant)
 	c.commonMetrics.hitsTotal.WithLabelValues(cacheTypeSeries, tenancy.DefaultTenant)
 	c.commonMetrics.hitsTotal.WithLabelValues(cacheTypeExpandedPostings, tenancy.DefaultTenant)
 
-	c.current = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-		Name: "thanos_store_index_cache_items",
-		Help: "Current number of items in the index cache.",
-	}, []string{"item_type"})
-	c.current.WithLabelValues(cacheTypePostings)
-	c.current.WithLabelValues(cacheTypeSeries)
-	c.current.WithLabelValues(cacheTypeExpandedPostings)
-
-	c.currentSize = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-		Name: "thanos_store_index_cache_items_size_bytes",
-		Help: "Current byte size of items in the index cache.",
-	}, []string{"item_type"})
-	c.currentSize.WithLabelValues(cacheTypePostings)
-	c.currentSize.WithLabelValues(cacheTypeSeries)
-	c.currentSize.WithLabelValues(cacheTypeExpandedPostings)
-
-	c.totalCurrentSize = promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-		Name: "thanos_store_index_cache_total_size_bytes",
-		Help: "Current byte size of items (both value and key) in the index cache.",
-	}, []string{"item_type"})
-	c.totalCurrentSize.WithLabelValues(cacheTypePostings)
-	c.totalCurrentSize.WithLabelValues(cacheTypeSeries)
-	c.totalCurrentSize.WithLabelValues(cacheTypeExpandedPostings)
-
-	_ = promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "thanos_store_index_cache_max_size_bytes",
-		Help: "Maximum number of bytes to be held in the index cache.",
-	}, func() float64 {
-		return float64(c.maxSizeBytes)
-	})
-	_ = promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "thanos_store_index_cache_max_item_size_bytes",
-		Help: "Maximum number of bytes for single entry to be held in the index cache.",
-	}, func() float64 {
-		return float64(c.maxItemSizeBytes)
-	})
-
-	// Initialize LRU cache with a high size limit since we will manage evictions ourselves
-	// based on stored size using `RemoveOldest` method.
-	l, err := lru.NewLRU(maxInt, c.onEvict)
-	if err != nil {
-		return nil, err
-	}
-	c.lru = l
-
+	c.cache = fastcache.New(int(config.MaxSize))
 	level.Info(logger).Log(
 		"msg", "created in-memory index cache",
 		"maxItemSizeBytes", c.maxItemSizeBytes,
@@ -186,43 +142,44 @@ func NewInMemoryIndexCacheWithConfig(logger log.Logger, commonMetrics *commonMet
 	return c, nil
 }
 
-func (c *InMemoryIndexCache) onEvict(key, val interface{}) {
-	k := key.(cacheKey).keyType()
-	entrySize := sliceHeaderSize + uint64(len(val.([]byte)))
-
-	c.evicted.WithLabelValues(k).Inc()
-	c.current.WithLabelValues(k).Dec()
-	c.currentSize.WithLabelValues(k).Sub(float64(entrySize))
-	c.totalCurrentSize.WithLabelValues(k).Sub(float64(entrySize + key.(cacheKey).size()))
-
-	c.curSize -= entrySize
-}
-
-func (c *InMemoryIndexCache) get(typ string, key cacheKey, tenant string) ([]byte, bool) {
-	c.commonMetrics.requestTotal.WithLabelValues(typ, tenant).Inc()
-
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-
-	v, ok := c.lru.Get(key)
-	if !ok {
+func (c *InMemoryIndexCache) get(key cacheKey) ([]byte, bool) {
+	k := yoloBuf(key.string())
+	resp := c.cache.GetBig(nil, k)
+	if len(resp) == 0 {
 		return nil, false
 	}
-	c.commonMetrics.hitsTotal.WithLabelValues(typ, tenant).Inc()
-	return v.([]byte), true
+	return resp, true
 }
 
 func (c *InMemoryIndexCache) set(typ string, key cacheKey, val []byte) {
-	var size = sliceHeaderSize + uint64(len(val))
+	k := yoloBuf(key.string())
 
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-
-	if _, ok := c.lru.Get(key); ok {
+	size := uint64(len(k) + len(val))
+	r := c.cache.GetBig(nil, k)
+	// item exists, no need to set it again.
+	if r != nil {
 		return
 	}
 
-	if !c.ensureFits(size, typ) {
+	if size > c.maxItemSizeBytes {
+		level.Info(c.logger).Log(
+			"msg", "item bigger than maxItemSizeBytes. Ignoring..",
+			"maxItemSizeBytes", c.maxItemSizeBytes,
+			"maxSizeBytes", c.maxSizeBytes,
+			"cacheType", typ,
+		)
+		c.overflow.WithLabelValues(typ).Inc()
+		return
+	}
+
+	// SetBig has a max key length restriction.
+	if len(k) > maxKeyLen {
+		level.Info(c.logger).Log(
+			"msg", "key bigger than maxKeyLen. Ignoring..",
+			"itemKeyLen", c.maxItemSizeBytes,
+			"maxKeyLen", maxKeyLen,
+			"cacheType", typ,
+		)
 		c.overflow.WithLabelValues(typ).Inc()
 		return
 	}
@@ -231,52 +188,12 @@ func (c *InMemoryIndexCache) set(typ string, key cacheKey, val []byte) {
 	// to ensure we don't waste huge amounts of space for something small.
 	v := make([]byte, len(val))
 	copy(v, val)
-	c.lru.Add(key, v)
-
+	c.cache.SetBig(k, v)
 	c.added.WithLabelValues(typ).Inc()
-	c.currentSize.WithLabelValues(typ).Add(float64(size))
-	c.totalCurrentSize.WithLabelValues(typ).Add(float64(size + key.size()))
-	c.current.WithLabelValues(typ).Inc()
-	c.curSize += size
 }
 
-// ensureFits tries to make sure that the passed slice will fit into the LRU cache.
-// Returns true if it will fit.
-func (c *InMemoryIndexCache) ensureFits(size uint64, typ string) bool {
-	if size > c.maxItemSizeBytes {
-		level.Debug(c.logger).Log(
-			"msg", "item bigger than maxItemSizeBytes. Ignoring..",
-			"maxItemSizeBytes", c.maxItemSizeBytes,
-			"maxSizeBytes", c.maxSizeBytes,
-			"curSize", c.curSize,
-			"itemSize", size,
-			"cacheType", typ,
-		)
-		return false
-	}
-
-	for c.curSize+size > c.maxSizeBytes {
-		if _, _, ok := c.lru.RemoveOldest(); !ok {
-			level.Error(c.logger).Log(
-				"msg", "LRU has nothing more to evict, but we still cannot allocate the item. Resetting cache.",
-				"maxItemSizeBytes", c.maxItemSizeBytes,
-				"maxSizeBytes", c.maxSizeBytes,
-				"curSize", c.curSize,
-				"itemSize", size,
-				"cacheType", typ,
-			)
-			c.reset()
-		}
-	}
-	return true
-}
-
-func (c *InMemoryIndexCache) reset() {
-	c.lru.Purge()
-	c.current.Reset()
-	c.currentSize.Reset()
-	c.totalCurrentSize.Reset()
-	c.curSize = 0
+func yoloBuf(s string) []byte {
+	return *(*[]byte)(unsafe.Pointer(&s))
 }
 
 func copyString(s string) string {
@@ -309,17 +226,25 @@ func (c *InMemoryIndexCache) FetchMultiPostings(ctx context.Context, blockID uli
 	hits = map[labels.Label][]byte{}
 
 	blockIDKey := blockID.String()
+	requests := 0
+	hit := 0
 	for _, key := range keys {
 		if ctx.Err() != nil {
+			c.commonMetrics.requestTotal.WithLabelValues(cacheTypePostings, tenant).Add(float64(requests))
+			c.commonMetrics.hitsTotal.WithLabelValues(cacheTypePostings, tenant).Add(float64(hit))
 			return hits, misses
 		}
-		if b, ok := c.get(cacheTypePostings, cacheKey{blockIDKey, cacheKeyPostings(key), ""}, tenant); ok {
+		requests++
+		if b, ok := c.get(cacheKey{blockIDKey, cacheKeyPostings(key), ""}); ok {
+			hit++
 			hits[key] = b
 			continue
 		}
 
 		misses = append(misses, key)
 	}
+	c.commonMetrics.requestTotal.WithLabelValues(cacheTypePostings, tenant).Add(float64(requests))
+	c.commonMetrics.hitsTotal.WithLabelValues(cacheTypePostings, tenant).Add(float64(hit))
 
 	return hits, misses
 }
@@ -338,7 +263,9 @@ func (c *InMemoryIndexCache) FetchExpandedPostings(ctx context.Context, blockID 
 	if ctx.Err() != nil {
 		return nil, false
 	}
-	if b, ok := c.get(cacheTypeExpandedPostings, cacheKey{blockID.String(), cacheKeyExpandedPostings(labelMatchersToString(matchers)), ""}, tenant); ok {
+	c.commonMetrics.requestTotal.WithLabelValues(cacheTypeExpandedPostings, tenant).Inc()
+	if b, ok := c.get(cacheKey{blockID.String(), cacheKeyExpandedPostings(labelMatchersToString(matchers)), ""}); ok {
+		c.commonMetrics.hitsTotal.WithLabelValues(cacheTypeExpandedPostings, tenant).Inc()
 		return b, true
 	}
 	return nil, false
@@ -360,17 +287,25 @@ func (c *InMemoryIndexCache) FetchMultiSeries(ctx context.Context, blockID ulid.
 	hits = map[storage.SeriesRef][]byte{}
 
 	blockIDKey := blockID.String()
+	requests := 0
+	hit := 0
 	for _, id := range ids {
 		if ctx.Err() != nil {
+			c.commonMetrics.requestTotal.WithLabelValues(cacheTypeSeries, tenant).Add(float64(requests))
+			c.commonMetrics.hitsTotal.WithLabelValues(cacheTypeSeries, tenant).Add(float64(hit))
 			return hits, misses
 		}
-		if b, ok := c.get(cacheTypeSeries, cacheKey{blockIDKey, cacheKeySeries(id), ""}, tenant); ok {
+		requests++
+		if b, ok := c.get(cacheKey{blockIDKey, cacheKeySeries(id), ""}); ok {
+			hit++
 			hits[id] = b
 			continue
 		}
 
 		misses = append(misses, id)
 	}
+	c.commonMetrics.requestTotal.WithLabelValues(cacheTypeSeries, tenant).Add(float64(requests))
+	c.commonMetrics.hitsTotal.WithLabelValues(cacheTypeSeries, tenant).Add(float64(hit))
 
 	return hits, misses
 }
